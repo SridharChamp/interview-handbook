@@ -852,6 +852,13 @@ html[data-theme="dark"] .vsvg .hwsub,html[data-theme="dark"] .vsvg .hwnote{fill:
 @media (max-width:560px){
   #backtoday{left:12px;bottom:12px;padding:10px 14px;font-size:12.5px}
 }
+
+/* first-pass card sits visually apart from the due-review card */
+.scard.recall.first{border-left:3px solid var(--pc,#B23B1E)}
+
+/* deferred-backlog note inside step 1 */
+.swhy.defer{margin-top:9px;padding:9px 12px;border-radius:7px;
+  background:rgba(217,119,6,.10);border:1px solid rgba(217,119,6,.3)}
 </style>
 </head>
 <body>
@@ -22170,6 +22177,8 @@ def length_of_lis(nums):            # O(n log n)
 
 
 
+
+
 <script>/* ============================================================
    CURRICULUM — day plan + active-recall deck
    Each day: { track, title, why, read[], practice, cards[] }
@@ -22750,7 +22759,7 @@ window.PLAN = PLAN;
     return snapshotText;
   }
 
-  let cfg = { track: "py", start: today(), done: {}, newCap: 5, typed: true, order: "block" };
+  let cfg = { track: "py", start: today(), done: {}, newCap: 5, maxReviews: 40, typed: true, order: "block" };
   let sr = {};
   let log = {};
   let gapDays = 0;
@@ -22790,31 +22799,86 @@ window.PLAN = PLAN;
   const allCards = () => days().flatMap(cardsOfDay);
   const dayNumber = () => Math.max(0, Math.min(today() - cfg.start, days().length - 1));
 
-  /* ---------- scheduling ---------- */
+  /* ---------- scheduling ----------
+     A card is in one of two phases.
+
+     LEARNING — a card you have never successfully recalled. It stays in
+     today's session and comes back a few cards later until you have produced
+     it correctly twice. Only then does it get a real interval. Sending a
+     brand-new card away for a day after one lucky look is how people end up
+     with a schedule full of things they never actually learned.
+
+     REVIEW — a graduated card. Intervals grow by the ease factor, shrink when
+     you struggle, and reset on a miss. Intervals are fuzzed slightly so that
+     cards learned on the same day don't come back on the same day forever. */
+  const LEARN_PASSES = 2;          // correct recalls needed to graduate
+  const LEECH_WARN = 5, LEECH_SUSPEND = 8;
+
+  const fuzz = ivl => {
+    if (ivl < 3) return ivl;                       // too short to spread
+    const spread = Math.max(1, Math.round(ivl * 0.12));
+    return Math.max(1, ivl + Math.round((Math.random() * 2 - 1) * spread));
+  };
+
   function grade(id, g) {
-    const s = sr[id] || { ease: 2.5, ivl: 0, due: today(), reps: 0, lapses: 0, hits: 0, tries: 0 };
+    const s = sr[id] || { ease: 2.5, ivl: 0, due: today(), reps: 0, lapses: 0,
+                          hits: 0, tries: 0, learn: 0 };
+    if (s.learn == null) s.learn = s.reps > 0 ? LEARN_PASSES : 0;
     s.tries++;
-    if (g === 0) { s.ease = Math.max(1.3, s.ease - 0.2); s.reps = 0; s.lapses++; s.ivl = 0; }
-    else {
-      s.hits++;
-      if (g === 1) { s.ease = Math.max(1.3, s.ease - 0.15); s.reps++; s.ivl = Math.max(1, Math.round((s.ivl || 1) * 1.2)); }
-      else if (g === 2) { s.reps++; s.ivl = s.reps === 1 ? 1 : s.reps === 2 ? 3 : Math.round(s.ivl * s.ease); }
-      else { s.ease = Math.min(2.8, s.ease + 0.15); s.reps++; s.ivl = s.reps === 1 ? 3 : Math.round(s.ivl * s.ease * 1.3); }
+    let requeue = false;
+
+    if (s.learn < LEARN_PASSES) {
+      /* ---- learning phase: today only, no long intervals yet ---- */
+      if (g === 0) { s.learn = 0; requeue = true; }
+      else if (g === 1) { requeue = true; }                 // no credit, try again
+      else if (g === 2) { s.hits++; s.learn++; requeue = s.learn < LEARN_PASSES; }
+      else { s.hits++; s.learn = LEARN_PASSES; }            // Easy graduates at once
+      if (s.learn >= LEARN_PASSES) {
+        s.reps = 1;
+        s.ivl = g === 3 ? 3 : 1;                            // first real interval
+      } else {
+        s.ivl = 0;                                          // still due today
+      }
+    } else {
+      /* ---- review phase ---- */
+      if (g === 0) {
+        s.ease = Math.max(1.3, s.ease - 0.2);
+        s.reps = 0; s.lapses++; s.ivl = 0;
+        s.learn = LEARN_PASSES - 1;                         // relearn once before it leaves
+        requeue = true;
+      } else {
+        s.hits++;
+        if (g === 1) { s.ease = Math.max(1.3, s.ease - 0.15); s.reps++; s.ivl = fuzz(Math.max(1, Math.round((s.ivl || 1) * 1.2))); }
+        else if (g === 2) { s.reps++; s.ivl = fuzz(s.reps === 1 ? 1 : s.reps === 2 ? 3 : Math.round(s.ivl * s.ease)); }
+        else { s.ease = Math.min(2.8, s.ease + 0.15); s.reps++; s.ivl = fuzz(s.reps === 1 ? 3 : Math.round(s.ivl * s.ease * 1.3)); }
+      }
     }
+
     s.due = today() + s.ivl;
     s.seen = today();
-    s.leech = s.lapses >= 5;
+    s.leech = s.lapses >= LEECH_WARN;
+    /* A card missed this many times is not a memory problem. Park it and say so
+       rather than grinding it every day. */
+    if (s.lapses >= LEECH_SUSPEND) s.susp = true;
     sr[id] = s;
-    return s;
+    return { s, requeue };
   }
 
   const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; } return a; };
 
   function queue() {
     const n = dayNumber(), pool = allCards();
-    const due = pool.filter(c => sr[c.id] && sr[c.id].due <= today());
+    const live = c => sr[c.id] && !sr[c.id].susp;
+    /* Oldest debt first, then capped: coming back to 120 due cards makes people
+       quit. The remainder simply waits - nothing is lost, it just queues. */
+    const allDue = pool.filter(c => live(c) && sr[c.id].due <= today())
+                       .sort((a, b) => sr[a.id].due - sr[b.id].due);
+    const cap = cfg.maxReviews || 40;
+    const due = allDue.slice(0, cap);
+    const deferred = allDue.length - due.length;
     const fresh = pool.filter(c => c.dayIdx <= n && !sr[c.id]).slice(0, cfg.newCap);
-    return { due, fresh, all: shuffle([...due, ...fresh]) };
+    const suspended = pool.filter(c => sr[c.id] && sr[c.id].susp).length;
+    return { due, fresh, deferred, suspended, all: shuffle([...due, ...fresh]) };
   }
 
   const stats = () => {
@@ -22892,12 +22956,17 @@ window.PLAN = PLAN;
       </div>
 
       <div class="scard recall">
-        <div class="stag">Step 1 &middot; Review first</div>
-        <h3>${q.all.length ? `${q.all.length} card${q.all.length > 1 ? "s" : ""} waiting` : "Nothing due \u2014 you're clear"}</h3>
-        <p class="swhy">${q.all.length
-        ? `${q.due.length} scheduled review${q.due.length === 1 ? "" : "s"} and ${q.fresh.length} new, shuffled together on purpose \u2014 mixing topics trains recognition, which is the part that fails in interviews. <strong>Say each answer out loud before you flip.</strong>`
-        : "Come back tomorrow. A day of only recall is worth more than a day of only reading."}</p>
-        ${q.all.length ? `<button class="vbtn primary" data-a="review">Start review \u2192</button>` : ""}
+        <div class="stag">Step 1 &middot; Review what you've already met</div>
+        <h3>${q.due.length ? `${q.due.length} card${q.due.length > 1 ? "s" : ""} due` : "Nothing due today"}</h3>
+        <p class="swhy">${q.due.length
+        ? `Only material you've studied before, drawn from every subject at once \u2014 mixing topics trains recognition, which is the part that fails in interviews. <strong>Say each answer out loud before you flip.</strong>`
+        : (Object.keys(sr).length
+            ? "Everything you've learned is still in date. Go straight to today's reading."
+            : "Nothing to review yet \u2014 this is your first session. Start with the reading below; today's cards come after it.")}</p>
+        ${q.deferred ? `<p class="swhy defer"><b>${q.deferred} more are overdue</b> and waiting behind these.
+          A wall of cards is how people quit, so the day is capped at ${cfg.maxReviews || 40}. Clear today's and the
+          rest come forward tomorrow \u2014 nothing is lost.</p>` : ""}
+        ${q.due.length ? `<button class="vbtn primary" data-a="review-due">Start review \u2192</button>` : ""}
         ${st.leeches ? `<button class="vbtn" data-a="leeches">${st.leeches} sticking point${st.leeches > 1 ? "s" : ""}</button>` : ""}
       </div>
 
@@ -22915,6 +22984,18 @@ window.PLAN = PLAN;
           <input type="checkbox" ${doneToday ? "checked" : ""}>
           <span>${doneToday ? "Day complete \u2014 nice." : "Mark reading, practice and teach-back done"}</span>
         </label>
+      </div>
+
+      <div class="scard recall first">
+        <div class="stag">Step 3 &middot; Lock in today's cards</div>
+        <h3>${q.fresh.length ? `${q.fresh.length} new card${q.fresh.length > 1 ? "s" : ""} from today` : "No new cards today"}</h3>
+        <p class="swhy">${q.fresh.length
+        ? `Do these <em>after</em> the reading \u2014 they're your first attempt at producing what you just read, which is
+           what turns \u201cthat makes sense\u201d into \u201cI can say it\u201d. A new card keeps coming back later in this
+           session until you've recalled it correctly twice; only then does it get a real interval and leave for a day
+           or more. <strong>Answer out loud or type it before you flip.</strong>`
+        : "Today is reading and practice only. Tomorrow's review will still pick up everything you've done."}</p>
+        ${q.fresh.length ? `<button class="vbtn primary" data-a="review-fresh">Start today's cards \u2192</button>` : ""}
       </div>
 
       <div class="scard">
@@ -22947,7 +23028,7 @@ window.PLAN = PLAN;
 
   /* ---------- leeches ---------- */
   function leeches() {
-    const bad = allCards().filter(c => sr[c.id] && sr[c.id].leech);
+    const bad = allCards().filter(c => sr[c.id] && (sr[c.id].leech || sr[c.id].susp));
     root().innerHTML = `
       <div class="revbar"><button class="vbtn" data-a="back">\u2039 Back</button></div>
       <div class="scard">
@@ -22957,17 +23038,35 @@ window.PLAN = PLAN;
         the card is doing too much and should be split into separate facts; you memorised words without the
         mechanism, so go back and read the <em>why</em>; or you have no hook \u2014 attach it to a bug you've hit
         or a line in your own project.</p>
+        ${bad.some(c => sr[c.id].susp) ? `<p class="swhy">Parked cards have stopped appearing in reviews so they
+          can't drain your sessions. Go back and read the mechanism behind them \u2014 then bring them back, and
+          they start again from scratch.</p>
+          <button class="vbtn" data-a="unpark">Put parked cards back in rotation</button>` : ""}
         ${bad.map(c => `<div class="leech"><div class="leechq">${fmt(c.q)}</div>
-          <div class="leechm">missed ${sr[c.id].lapses}\u00d7 \u00b7 from ${c.day}</div>
+          <div class="leechm">missed ${sr[c.id].lapses}\u00d7 \u00b7 from ${c.day}${
+            sr[c.id].susp ? ' \u00b7 <b>parked \u2014 not being shown any more</b>' : ""}</div>
           <div class="leecha">${fmt(c.a)}</div></div>`).join("")}
       </div>`;
-    root().onclick = e => { if (e.target.closest('[data-a="back"]')) { bind(); render(); } };
+    root().onclick = async e => {
+      if (e.target.closest('[data-a="back"]')) { bind(); render(); return; }
+      if (e.target.closest('[data-a="unpark"]')) {
+        allCards().forEach(c => {
+          const r = sr[c.id];
+          if (r && r.susp) { r.susp = false; r.lapses = 0; r.leech = false; r.learn = 0; r.reps = 0; r.ivl = 0; r.due = today(); }
+        });
+        await store.set("sr", sr);
+        bind(); render();
+      }
+    };
   }
 
   /* ---------- review session ---------- */
-  function review() {
+  function review(which) {
     const q = queue();
-    let deck = q.all.slice(), i = 0, stage = "ask", again = [], answered = 0, right = 0, typedText = "";
+    const chosen = which === "fresh" ? q.fresh
+                 : which === "due"   ? q.due
+                 : q.all;
+    let deck = shuffle(chosen.slice()), i = 0, stage = "ask", again = [], answered = 0, right = 0, typedText = "";
 
     function draw() {
       if (i >= deck.length) {
@@ -23026,9 +23125,10 @@ window.PLAN = PLAN;
       if (a === "flip") { const ta = $(".revin"); typedText = ta ? ta.value : ""; stage = "show"; return draw(); }
       if (gEl) {
         const c = deck[i], gv = Number(gEl.dataset.g);
-        grade(c.id, gv);
+        const res = grade(c.id, gv);
         answered++; if (gv >= 2) right++;
-        if (gv === 0) again.push(c);
+        /* A card still in its learning steps comes back before the session ends. */
+        if (res.requeue) again.push(c);
         await store.set("sr", sr);
         i++; stage = "ask"; typedText = ""; draw();
       }
@@ -23054,6 +23154,8 @@ window.PLAN = PLAN;
       const aEl = e.target.closest("[data-a]");
       const a = aEl ? aEl.dataset.a : null;
       if (a === "review") return review();
+      if (a === "review-due") return review("due");
+      if (a === "review-fresh") return review("fresh");
       if (a === "leeches") return leeches();
       if (a === "today") { cfg.start = today() - dayNumber(); await store.set("cfg", cfg); return render(); }
       if (a === "shift") { cfg.start += gapDays; gapDays = 0; await store.set("cfg", cfg); return render(); }
@@ -23182,7 +23284,7 @@ window.PLAN = PLAN;
   window.initStudy = async () => {
     await store.probe();
     const saved = await store.get("cfg", null);
-    cfg = Object.assign({ track: "py", start: today(), done: {}, newCap: 5, typed: true, order: "block" }, saved || {});
+    cfg = Object.assign({ track: "py", start: today(), done: {}, newCap: 5, maxReviews: 40, typed: true, order: "block" }, saved || {});
     if (!cfg.done) cfg.done = {};
     sr = (await store.get("sr", {})) || {};
     log = (await store.get("log", {})) || {};
